@@ -14,35 +14,57 @@ on:
         type: choice
         options: [all, tram, subway, rail, bus, ferry, cablecar, gondola, funicular, coach, monorail, trolley]
       layout:
-        description: Map layout
+        description: Map layout ('all' generates all three, sharing the shared line-ordering stage)
         required: true
         default: octilinear
         type: choice
-        options: [geographic, octilinear, orthoradial]
+        options: [geographic, octilinear, orthoradial, all]
       labels:
         description: Render station labels
         required: true
         default: false
         type: boolean
+      aggregate_by:
+        description: Group trips into lines by this GTFS field. route_short_name merges route_id variants sharing a public route number (fixes feeds that mint a new route_id per shape/pattern).
+        required: true
+        default: route_id
+        type: choice
+        options: [route_id, route_short_name]
+      routes:
+        description: 'Optional: comma-separated route_short_names to restrict the feed to (blank = all routes)'
+        required: false
+        default: ''
+        type: string
       save_intermediates:
         description: Upload intermediate GeoJSON files
         required: true
         default: false
         type: boolean
       output_name:
-        description: Output SVG filename, without paths
+        description: Output SVG base filename, without paths
         required: true
         default: network.svg
         type: string
 
+env:
+  IMAGE_NAME: loom-map
+
 jobs:
-  generate:
+  prepare:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+      svg_base: ${{ steps.names.outputs.svg_base }}
+      layouts: ${{ steps.layouts.outputs.json }}
     steps:
       - name: Checkout repository code
         uses: actions/checkout@v7
         with:
           submodules: recursive
+
       - name: Prepare names
         id: names
         shell: bash
@@ -50,60 +72,317 @@ jobs:
           set -euo pipefail
           out='${{ inputs.output_name }}'
           base="$(basename "$out")"
-          if [[ "$base" != *.svg ]]; then base="$base.svg"; fi
-          if [[ "$base" == ".svg" || "$base" == *"/"* || "$base" == *".."* ]]; then
+          base="${base%.svg}"
+          if [[ -z "$base" || "$base" == *"/"* || "$base" == *".."* ]]; then
             echo "Invalid output_name" >&2
             exit 1
           fi
-          echo "svg=$base" >> "$GITHUB_OUTPUT"
-      - name: Build Docker image
-        run: docker build -t loom-map .
+          echo "svg_base=$base" >> "$GITHUB_OUTPUT"
+
+      - name: Compute layout matrix
+        id: layouts
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ '${{ inputs.layout }}' == 'all' ]]; then
+            echo 'json=["geographic","octilinear","orthoradial"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "json=[\"${{ inputs.layout }}\"]" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image (pin to commit, latest, then build+push fallback)
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          # Prefer the image built from this exact commit: `latest` can be
+          # stale relative to the ref this workflow was dispatched on (e.g. a
+          # feature branch, or a manual run before build-image.yml has
+          # published this commit yet), and this workflow's `graph` job
+          # relies on wrapper CLI flags that only exist from this commit on.
+          pinned="ghcr.io/$owner/${IMAGE_NAME}:sha-${{ github.sha }}"
+          published="ghcr.io/$owner/${IMAGE_NAME}:latest"
+          if docker pull "$pinned"; then
+            echo "image=$pinned" >> "$GITHUB_OUTPUT"
+          elif docker pull "$published"; then
+            echo "::warning::No image published for commit ${{ github.sha }}; falling back to :latest, which may not match this commit."
+            echo "image=$published" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No published image found; building locally as a one-off fallback (run 'Build and Publish Docker Image' on main to avoid this)."
+            fallback="ghcr.io/$owner/${IMAGE_NAME}:run-${{ github.run_id }}"
+            docker build -t "$fallback" .
+            docker push "$fallback"
+            echo "image=$fallback" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download GTFS feed
         shell: bash
         run: |
           set -euo pipefail
           url='${{ inputs.gtfs_url }}'
           case "$url" in http://*|https://*) ;; *) echo "gtfs_url must start with http:// or https://" >&2; exit 1;; esac
-          mkdir -p work artifacts diagnostics
+          mkdir -p work
           curl --fail --location --show-error --silent --connect-timeout 20 --max-time 300 --output work/input.gtfs.zip "$url"
           test -s work/input.gtfs.zip
-      - name: Generate map
-        id: generate
+
+      - name: Upload GTFS feed
+        uses: actions/upload-artifact@v7
+        with:
+          name: loom-map-gtfs-feed
+          path: work/input.gtfs.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  graph:
+    name: Extract GTFS graph
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      packages: read
+    steps:
+      - name: Download GTFS feed
+        uses: actions/download-artifact@v7
+        with:
+          name: loom-map-gtfs-feed
+          path: work
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image
+        run: docker pull '${{ needs.prepare.outputs.image }}'
+
+      - name: Extract GTFS graph
         shell: bash
         run: |
           set -euo pipefail
-          args=(/data/work/input.gtfs.zip --mode '${{ inputs.mode }}' --layout '${{ inputs.layout }}' --output "/data/artifacts/${{ steps.names.outputs.svg }}" --work-dir /data/work/debug --verbose)
-          if [[ '${{ inputs.labels }}' == 'true' ]]; then args+=(--labels); else args+=(--no-labels); fi
-          if [[ '${{ inputs.save_intermediates }}' == 'true' ]]; then args+=(--save-intermediates); fi
-          docker run --rm -v "$PWD:/data" loom-map "${args[@]}" 2>&1 | tee diagnostics/loom-map.log
-      - name: Upload SVG artifact
+          mkdir -p artifacts diagnostics
+          args=(graph /data/work/input.gtfs.zip --mode '${{ inputs.mode }}' --aggregate-by '${{ inputs.aggregate_by }}' --output /data/artifacts/01-gtfs-graph.geojson --verbose)
+          if [[ -n '${{ inputs.routes }}' ]]; then
+            args+=(--routes '${{ inputs.routes }}')
+          fi
+          docker run --rm -v "$PWD:/data" '${{ needs.prepare.outputs.image }}' "${args[@]}" 2>&1 | tee diagnostics/graph.log
+
+      - name: Upload graph
         if: success()
         uses: actions/upload-artifact@v7
         with:
-          name: loom-map-svg
-          path: artifacts/${{ steps.names.outputs.svg }}
+          name: loom-map-graph
+          path: artifacts/01-gtfs-graph.geojson
           if-no-files-found: error
-      - name: Upload intermediates
-        if: success() && inputs.save_intermediates
-        uses: actions/upload-artifact@v7
-        with:
-          name: loom-map-intermediates
-          path: work/debug/*
-          if-no-files-found: warn
+
       - name: Upload diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: loom-map-diagnostics
-          path: |
-            diagnostics/*
-            work/debug/*
+          name: loom-map-diagnostics-graph
+          path: diagnostics/*
           if-no-files-found: warn
-      - name: Write summary
-        if: always()
+
+  topology:
+    name: Resolve topology
+    needs: [prepare, graph]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      packages: read
+    steps:
+      - name: Download graph
+        uses: actions/download-artifact@v7
+        with:
+          name: loom-map-graph
+          path: work
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image
+        run: docker pull '${{ needs.prepare.outputs.image }}'
+
+      - name: Resolve topology
         shell: bash
         run: |
-          result="${{ job.status }}"
+          set -euo pipefail
+          docker run --rm -i '${{ needs.prepare.outputs.image }}' topo \
+            < work/01-gtfs-graph.geojson > 02-topology.geojson
+
+      - name: Upload topology
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: loom-map-topology
+          path: 02-topology.geojson
+          if-no-files-found: error
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: loom-map-diagnostics-topology
+          path: work/01-gtfs-graph.geojson
+          if-no-files-found: warn
+
+  line-ordering:
+    name: Optimise line ordering
+    needs: [prepare, topology]
+    runs-on: ubuntu-24.04
+    # This is the stage that previously hung for 3+ hours with no visibility.
+    # Bounding it means a bad run now fails loudly here (with the topology
+    # artifact preserved for diagnosis) instead of an opaque multi-hour hang.
+    timeout-minutes: 90
+    permissions:
+      packages: read
+    steps:
+      - name: Download topology
+        uses: actions/download-artifact@v7
+        with:
+          name: loom-map-topology
+          path: work
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image
+        run: docker pull '${{ needs.prepare.outputs.image }}'
+
+      - name: Optimise line ordering
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -i '${{ needs.prepare.outputs.image }}' loom \
+            < work/02-topology.geojson > 03-line-ordering.geojson
+
+      - name: Upload line ordering
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: loom-map-line-ordering
+          path: 03-line-ordering.geojson
+          if-no-files-found: error
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: loom-map-diagnostics-line-ordering
+          path: work/02-topology.geojson
+          if-no-files-found: warn
+
+  render:
+    name: Render (${{ matrix.layout }})
+    needs: [prepare, line-ordering]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        layout: ${{ fromJson(needs.prepare.outputs.layouts) }}
+    steps:
+      - name: Download line ordering
+        uses: actions/download-artifact@v7
+        with:
+          name: loom-map-line-ordering
+          path: work
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image
+        run: docker pull '${{ needs.prepare.outputs.image }}'
+
+      - name: Create schematic layout
+        if: matrix.layout != 'geographic'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case '${{ matrix.layout }}' in
+            octilinear) octi_args=(--ilp-solver cbc) ;;
+            orthoradial) octi_args=(-b orthoradial --ilp-solver cbc) ;;
+            *) echo "Unknown layout: ${{ matrix.layout }}" >&2; exit 1 ;;
+          esac
+          docker run --rm -i '${{ needs.prepare.outputs.image }}' octi "${octi_args[@]}" \
+            < work/03-line-ordering.geojson > 04-schematic.geojson
+
+      - name: Render SVG
+        shell: bash
+        run: |
+          set -euo pipefail
+          render_args=(--render-engine svg)
+          if [[ '${{ inputs.labels }}' == 'true' ]]; then
+            render_args+=(--labels)
+          fi
+          if [[ '${{ matrix.layout }}' == 'geographic' ]]; then
+            source=work/03-line-ordering.geojson
+          else
+            source=04-schematic.geojson
+          fi
+          docker run --rm -i '${{ needs.prepare.outputs.image }}' transitmap "${render_args[@]}" \
+            < "$source" > '${{ needs.prepare.outputs.svg_base }}-${{ matrix.layout }}.svg'
+
+      - name: Upload SVG artifact
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: loom-map-svg-${{ matrix.layout }}
+          path: ${{ needs.prepare.outputs.svg_base }}-${{ matrix.layout }}.svg
+          if-no-files-found: error
+
+      - name: Upload intermediates
+        if: success() && inputs.save_intermediates
+        uses: actions/upload-artifact@v7
+        with:
+          name: loom-map-intermediates-${{ matrix.layout }}
+          path: |
+            work/03-line-ordering.geojson
+            04-schematic.geojson
+          if-no-files-found: ignore
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: loom-map-diagnostics-render-${{ matrix.layout }}
+          path: |
+            work/03-line-ordering.geojson
+            04-schematic.geojson
+          if-no-files-found: ignore
+
+  summary:
+    name: Write summary
+    if: always()
+    needs: [prepare, graph, topology, line-ordering, render]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Write summary
+        shell: bash
+        run: |
           {
             echo "## LOOM map generation"
             echo ""
@@ -111,6 +390,13 @@ jobs:
             echo "Mode: ${{ inputs.mode }}"
             echo "Layout: ${{ inputs.layout }}"
             echo "Labels: ${{ inputs.labels }}"
-            echo "Output: ${{ steps.names.outputs.svg }}"
-            echo "Result: $result"
+            echo "Aggregate by: ${{ inputs.aggregate_by }}"
+            echo "Routes filter: ${{ inputs.routes || '(none)' }}"
+            echo ""
+            echo "| Stage | Result |"
+            echo "| --- | --- |"
+            echo "| graph | ${{ needs.graph.result }} |"
+            echo "| topology | ${{ needs.topology.result }} |"
+            echo "| line-ordering | ${{ needs.line-ordering.result }} |"
+            echo "| render | ${{ needs.render.result }} |"
           } >> "$GITHUB_STEP_SUMMARY"
