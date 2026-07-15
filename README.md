@@ -52,7 +52,64 @@ loom-map network.zip \
   --work-dir ./loom-debug
 ```
 
-The preserved stage outputs are named clearly, for example `01-gtfs-graph.geojson`, `02-topology.geojson`, `03-line-ordering.geojson`, `04-schematic.geojson`, and `05-map.svg`. The schematic stage is only present for schematic layouts.
+The preserved stage outputs are named clearly, for example `01-gtfs-graph.geojson`, `02-topology.geojson`, `03-line-ordering.geojson`, `04-schematic.geojson`, and `05-map.svg`. The schematic stage is only present for schematic layouts. When `--layout all` is used, stages 4 and 5 are suffixed per layout (`04-schematic-octilinear.geojson`, `05-map-octilinear.svg`, and so on).
+
+Generate all three layouts at once:
+
+```sh
+loom-map network.zip --layout all --output network.svg
+```
+
+This runs the shared, expensive stages (`gtfs2graph`, `topo`, `loom`) once and only re-runs the cheap final stage(s) per layout, writing `network-geographic.svg`, `network-octilinear.svg`, and `network-orthoradial.svg`.
+
+`graph` and `render` subcommands
+---------------------------------
+
+The full pipeline can be split into two independently useful pieces:
+
+```sh
+# GTFS -> GeoJSON line graph only (the gtfs2graph stage)
+loom-map graph network.zip -o network-graph.json --mode rail
+
+# GeoJSON line graph -> SVG map only (topo -> loom -> [octi] -> transitmap)
+loom-map render network-graph.json -o network.svg --layout octilinear --labels
+```
+
+`loom-map network.zip` is equivalent to running `graph` followed by `render`.
+Splitting them lets you cache or inspect the graph extraction step separately
+from rendering, or render several layouts from one extracted graph without
+re-parsing the GTFS feed. `render` also accepts `--layout all`.
+
+Route aggregation and filtering
+--------------------------------
+
+`gtfs2graph` groups trips into a "line" by GTFS `route_id` identity, not by
+`route_short_name`. Most feeds mint one `route_id` per public route, but some
+(Translink among them) mint a fresh `route_id` per shape, pattern, or
+timetable variant under the same public route number — which can turn a
+handful of real routes into hundreds of apparent "lines", both misleading a
+reader and blowing up the line-ordering optimizer's runtime (its complexity
+scales with how many distinct lines converge at a station).
+
+`loom-map` and `loom-map graph` can rewrite the GTFS feed before extraction:
+
+```sh
+# Merge route_id variants that share a public route number
+loom-map network.zip --aggregate-by route_short_name
+
+# Restrict the feed to specific public route numbers
+loom-map network.zip --routes 66,130,P1
+
+# Both together
+loom-map network.zip --aggregate-by route_short_name --routes 66,130,P1
+```
+
+`--aggregate-by` defaults to `route_id` (today's behavior, unchanged) and
+accepts `route_short_name` to merge `route_id`s sharing a short name onto one
+canonical `route_id` before extraction. `--routes` takes a comma-separated
+list matched against `route_short_name` and drops every other route (and its
+trips and stop times) before extraction. Both apply only to the `graph`
+stage; `render` operates on an already-extracted graph.
 
 Docker
 ------
@@ -73,29 +130,60 @@ docker run --rm \
   --output /data/network.svg
 ```
 
-The container entrypoint is `loom-map`. The original low-level LOOM tools remain available by naming one as the first argument:
+The container entrypoint is `loom-map`. The original low-level LOOM tools remain available by naming one as the first argument, and so are the `graph`/`render` subcommands:
 
 ```sh
 docker run --rm loom-map loom --help
 docker run --rm -i loom-map octi < examples/stuttgart.json > stuttgart-octi.json
+docker run --rm -v "$PWD:/data" loom-map graph /data/network.zip -o /data/network-graph.json
 ```
 
 The default Docker build uses open-source solvers (`coinor-cbc` and GLPK packages) and does not require Gurobi.
 
-GitHub Actions: Generate Transit Diagram
-----------------------------------------
+A prebuilt image is published to GHCR on every push to `main` (see below), so
+you don't need to build locally unless you've changed the source:
 
-A manual workflow is provided at `.github/workflows/generate-map.yml`.
+```sh
+docker pull ghcr.io/<owner>/loom-map:latest
+```
+
+GitHub Actions
+---------------
+
+Two workflows cover building and using the Docker image:
+
+**`.github/workflows/build-image.yml`** builds and publishes the image to
+`ghcr.io/<owner>/loom-map` (tagged `latest` and `sha-<commit>`) on every push
+to `main`, or on demand via `workflow_dispatch`. The image is built once here,
+not on every diagram generation run.
+
+**`.github/workflows/generate-map.yml`** (manual, "Generate Transit Diagram")
+turns a GTFS feed into one or more SVGs. It pulls the published image instead
+of rebuilding (falling back to a one-off local build+push if no published
+image exists yet, e.g. on a fork before its first `build-image.yml` run), and
+runs the pipeline as a chain of separate jobs — `prepare` -> `graph` ->
+`topology` -> `line-ordering` -> `render` (matrix, one leg per layout) ->
+`summary` — instead of one long `docker run`. Each stage gets its own log,
+duration, and timeout in the Actions UI (`line-ordering`, the optimizer stage,
+is capped at 90 minutes so a runaway feed fails loudly with its intermediate
+artifact preserved, instead of hanging silently for hours), and intermediate
+GeoJSON is passed between jobs as artifacts so a `--layout all` run only pays
+for graph extraction and line ordering once.
+
+To run it:
 
 1. Open the repository's **Actions** tab.
 2. Select **Generate Transit Diagram**.
 3. Click **Run workflow**.
 4. Paste a public `http://` or `https://` GTFS ZIP URL.
-5. Choose the mode, layout, labels, and whether to upload intermediates.
+5. Choose the mode, layout (including `all`), labels, aggregation field,
+   an optional route filter, and whether to upload intermediates.
 6. Run the workflow.
-7. Download the generated SVG artifact named `loom-map-svg`.
+7. Download the generated SVG artifact(s), named `loom-map-svg-<layout>`.
 
-The workflow downloads the feed with `curl --fail --location`, builds the Docker image from this repository, runs `loom-map`, uploads the SVG, optionally uploads intermediates, and uploads diagnostics if generation fails.
+If a stage fails, its job uploads a `loom-map-diagnostics-<stage>` artifact
+with the input it was given, so you can reproduce the failure locally with
+the same LOOM tool.
 
 Wrapper CLI
 -----------
@@ -106,19 +194,25 @@ Usage: loom-map INPUT [options]
 Generate a geographic or schematic transit diagram from a GTFS feed.
 
 Arguments:
-  INPUT                 Path to a GTFS ZIP file
+  INPUT                   Path to a GTFS ZIP file
 
 Options:
-  -o, --output PATH     Output SVG path
-  --mode MODE           Transit mode
-  --layout LAYOUT       geographic, octilinear, or orthoradial
-  --labels              Render stop/station labels
-  --no-labels           Do not render stop/station labels
-  --save-intermediates  Preserve GeoJSON output from each pipeline stage
-  --work-dir PATH       Working directory for intermediate files
-  --verbose             Show detailed pipeline information
-  -h, --help            Show help
-  --version             Show wrapper and source version
+  -o, --output PATH       Output SVG path (base name when --layout all)
+  --mode MODE             Transit mode
+  --layout LAYOUT         geographic, octilinear, orthoradial, or all
+  --aggregate-by FIELD    route_id (default) or route_short_name
+  --routes ROUTES         Comma-separated route_short_names to keep
+  --labels                Render stop/station labels
+  --no-labels             Do not render stop/station labels
+  --save-intermediates    Preserve GeoJSON output from each pipeline stage
+  --work-dir PATH         Working directory for intermediate files
+  --verbose               Show detailed pipeline information
+  -h, --help              Show help
+  --version               Show wrapper and source version
+
+Subcommands:
+  loom-map graph INPUT.zip -o graph.json      GTFS -> GeoJSON graph only
+  loom-map render graph.json -o network.svg   GeoJSON graph -> SVG only
 ```
 
 Supported modes
@@ -158,8 +252,9 @@ Supported layouts
 - `geographic`: `gtfs2graph -> topo -> loom -> transitmap`
 - `octilinear`: `gtfs2graph -> topo -> loom -> octi -> transitmap`
 - `orthoradial`: `gtfs2graph -> topo -> loom -> octi -b orthoradial -> transitmap`
+- `all`: generates all three above, writing `<output>-geographic.svg`, `<output>-octilinear.svg`, and `<output>-orthoradial.svg`. The shared `gtfs2graph -> topo -> loom` stages run once; only the cheap final stage(s) are repeated per layout.
 
-The underlying `octi` tool supports additional base graphs, but the wrapper intentionally exposes only these three user-facing layouts for the first MVP.
+The underlying `octi` tool supports additional base graphs, but the wrapper intentionally exposes only these three user-facing layouts (plus `all`) for the first MVP.
 
 Labels
 ------
@@ -180,6 +275,7 @@ Troubleshooting
 - `missing stops.txt` or similar: the input ZIP does not contain the required core GTFS files.
 - Schematic layout fails in `octi`: try `--layout geographic` to confirm extraction/topology/rendering first, then rerun with `--save-intermediates --work-dir ./loom-debug`.
 - Some GTFS feeds contain many routes. Start with a specific `--mode` such as `rail`, `subway`, or `tram` before trying `all`.
+- Line ordering (stage 3, `loom`) hanging or taking a very long time on a feed that shouldn't be that complex: this is usually a route-explosion problem, not a scale problem. If the agency mints a fresh `route_id` per shape/pattern/timetable variant under one public route number, `loom` sees far more "distinct lines" converging at busy stations than actually exist. Try `--aggregate-by route_short_name` first; narrowing with `--routes` also helps while iterating.
 
 Solver choice
 -------------

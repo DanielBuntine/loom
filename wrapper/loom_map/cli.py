@@ -6,11 +6,21 @@ import argparse
 from pathlib import Path
 import subprocess
 import sys
+from typing import List, Optional
 
 from . import __version__
-from .config import CANONICAL_MODES, DEFAULT_LAYOUT, DEFAULT_MODE, SUPPORTED_LAYOUTS, SUPPORTED_MODES
+from .config import (
+    AGGREGATE_BY_CHOICES,
+    CANONICAL_MODES,
+    DEFAULT_AGGREGATE_BY,
+    DEFAULT_LAYOUT,
+    DEFAULT_MODE,
+    LAYOUT_CHOICES,
+    SUPPORTED_MODES,
+)
 from .gtfs import GTFSValidationError, validate_gtfs_zip
-from .pipeline import PipelineError, PipelineOptions, run_pipeline
+from .gtfs_transform import GTFSTransformError
+from .pipeline import PipelineError, PipelineOptions, run_graph_only, run_pipeline, run_render_only
 
 
 class Parser(argparse.ArgumentParser):
@@ -34,6 +44,39 @@ def git_commit() -> str:
         return "unknown"
 
 
+def parse_routes(value: Optional[str]) -> Optional[List[str]]:
+    if not value:
+        return None
+    routes = [item.strip() for item in value.split(",") if item.strip()]
+    return routes or None
+
+
+def _add_route_selection_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--aggregate-by",
+        choices=AGGREGATE_BY_CHOICES,
+        default=DEFAULT_AGGREGATE_BY,
+        help=(
+            "Group trips into lines by this field (default: %(default)s). "
+            "route_short_name merges route_id variants that share a public "
+            "route number (e.g. one route_id per shape/pattern) into a "
+            "single line."
+        ),
+    )
+    parser.add_argument(
+        "--routes",
+        metavar="ROUTE1,ROUTE2,...",
+        help="Restrict the feed to routes whose route_short_name is in this comma-separated list",
+    )
+
+
+def _add_labels_args(parser: argparse.ArgumentParser) -> None:
+    labels = parser.add_mutually_exclusive_group()
+    labels.add_argument("--labels", dest="labels", action="store_true", help="Render stop/station labels")
+    labels.add_argument("--no-labels", dest="labels", action="store_false", help="Do not render stop/station labels (default)")
+    parser.set_defaults(labels=False)
+
+
 def build_parser() -> argparse.ArgumentParser:
     modes = ", ".join(CANONICAL_MODES)
     aliases = ", ".join(sorted(k for k in SUPPORTED_MODES if k not in CANONICAL_MODES))
@@ -44,24 +87,55 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             f"Supported modes: {modes}\n"
             f"Recognised aliases: {aliases}\n"
-            "Layouts: geographic (no octi stage), octilinear, orthoradial\n\n"
+            "Layouts: geographic (no octi stage), octilinear, orthoradial, all\n\n"
+            "Subcommands:\n"
+            "  loom-map graph INPUT.zip -o graph.json      GTFS -> GeoJSON graph only\n"
+            "  loom-map render graph.json -o network.svg   GeoJSON graph -> SVG only\n\n"
             "Examples:\n"
             "  loom-map network.zip\n"
-            "  loom-map network.zip --mode tram --layout octilinear --labels -o network.svg"
+            "  loom-map network.zip --mode tram --layout octilinear --labels -o network.svg\n"
+            "  loom-map network.zip --layout all\n"
+            "  loom-map network.zip --aggregate-by route_short_name --routes 66,130,P1"
         ),
     )
     parser.add_argument("input", nargs="?", type=Path, help="Path to a GTFS ZIP file")
-    parser.add_argument("-o", "--output", type=Path, help="Output SVG path")
+    parser.add_argument("-o", "--output", type=Path, help="Output SVG path (base name when --layout all)")
     parser.add_argument("--mode", default=DEFAULT_MODE, help=f"Transit mode (default: {DEFAULT_MODE})")
-    parser.add_argument("--layout", default=DEFAULT_LAYOUT, choices=SUPPORTED_LAYOUTS, help=f"Layout: {', '.join(SUPPORTED_LAYOUTS)} (default: {DEFAULT_LAYOUT})")
-    labels = parser.add_mutually_exclusive_group()
-    labels.add_argument("--labels", dest="labels", action="store_true", help="Render stop/station labels")
-    labels.add_argument("--no-labels", dest="labels", action="store_false", help="Do not render stop/station labels (default)")
-    parser.set_defaults(labels=False)
+    parser.add_argument("--layout", default=DEFAULT_LAYOUT, choices=LAYOUT_CHOICES, help=f"Layout: {', '.join(LAYOUT_CHOICES)} (default: {DEFAULT_LAYOUT})")
+    _add_labels_args(parser)
     parser.add_argument("--save-intermediates", action="store_true", help="Preserve GeoJSON output from each pipeline stage")
     parser.add_argument("--work-dir", type=Path, help="Working/debug directory for intermediate files")
     parser.add_argument("--verbose", action="store_true", help="Show detailed pipeline information")
     parser.add_argument("--version", action="store_true", help="Show version information and exit")
+    _add_route_selection_args(parser)
+    return parser
+
+
+def build_graph_parser() -> argparse.ArgumentParser:
+    parser = Parser(
+        prog="loom-map graph",
+        description="Extract a GeoJSON line graph from a GTFS feed (the gtfs2graph stage only).",
+    )
+    parser.add_argument("input", type=Path, help="Path to a GTFS ZIP file")
+    parser.add_argument("-o", "--output", type=Path, required=True, help="Output GeoJSON path")
+    parser.add_argument("--mode", default=DEFAULT_MODE, help=f"Transit mode (default: {DEFAULT_MODE})")
+    parser.add_argument("--verbose", action="store_true", help="Show detailed pipeline information")
+    _add_route_selection_args(parser)
+    return parser
+
+
+def build_render_parser() -> argparse.ArgumentParser:
+    parser = Parser(
+        prog="loom-map render",
+        description="Render a GeoJSON line graph into an SVG map (topo/loom/[octi]/transitmap stages).",
+    )
+    parser.add_argument("input", type=Path, help="Path to a GeoJSON line graph (e.g. produced by 'loom-map graph')")
+    parser.add_argument("-o", "--output", type=Path, required=True, help="Output SVG path (base name when --layout all)")
+    parser.add_argument("--layout", default=DEFAULT_LAYOUT, choices=LAYOUT_CHOICES, help=f"Layout: {', '.join(LAYOUT_CHOICES)} (default: {DEFAULT_LAYOUT})")
+    _add_labels_args(parser)
+    parser.add_argument("--save-intermediates", action="store_true", help="Preserve GeoJSON output from each pipeline stage")
+    parser.add_argument("--work-dir", type=Path, help="Working/debug directory for intermediate files")
+    parser.add_argument("--verbose", action="store_true", help="Show detailed pipeline information")
     return parser
 
 
@@ -81,7 +155,62 @@ def normalise_mode(mode: str) -> str:
     raise ValueError(f"unsupported mode '{mode}'. Supported modes: {', '.join(CANONICAL_MODES)}")
 
 
+def _run_graph_command(argv: List[str]) -> int:
+    parser = build_graph_parser()
+    args = parser.parse_args(argv)
+    try:
+        mode = normalise_mode(args.mode)
+        gtfs = args.input.expanduser().resolve()
+        validate_gtfs_zip(gtfs)
+        output = run_graph_only(
+            gtfs,
+            args.output.expanduser(),
+            mode,
+            aggregate_by=args.aggregate_by,
+            routes=parse_routes(args.routes),
+            verbose=args.verbose,
+        )
+        print(f"\nDone: {output}")
+        return 0
+    except (GTFSValidationError, GTFSTransformError, ValueError, FileNotFoundError, PermissionError, PipelineError, OSError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+def _run_render_command(argv: List[str]) -> int:
+    parser = build_render_parser()
+    args = parser.parse_args(argv)
+    try:
+        graph_path = args.input.expanduser().resolve()
+        if not graph_path.exists():
+            raise FileNotFoundError(f"Input file does not exist: {graph_path}")
+        if not graph_path.is_file():
+            raise ValueError(f"Input path is not a file: {graph_path}")
+        written = run_render_only(
+            graph_path,
+            args.output.expanduser(),
+            args.layout,
+            labels=args.labels,
+            verbose=args.verbose,
+            save_intermediates=args.save_intermediates,
+            work_dir=args.work_dir,
+        )
+        for path in written:
+            print(f"\nDone: {path}")
+        return 0
+    except (ValueError, FileNotFoundError, PermissionError, PipelineError, OSError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+
+    if argv and argv[0] == "graph":
+        return _run_graph_command(argv[1:])
+    if argv and argv[0] == "render":
+        return _run_render_command(argv[1:])
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -106,10 +235,12 @@ def main(argv: list[str] | None = None) -> int:
             save_intermediates=args.save_intermediates,
             work_dir=args.work_dir,
             verbose=args.verbose,
+            aggregate_by=args.aggregate_by,
+            routes=parse_routes(args.routes),
         )
         run_pipeline(options)
         return 0
-    except (GTFSValidationError, ValueError, FileNotFoundError, PermissionError, PipelineError, OSError) as exc:
+    except (GTFSValidationError, GTFSTransformError, ValueError, FileNotFoundError, PermissionError, PipelineError, OSError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 

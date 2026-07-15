@@ -13,7 +13,9 @@ jobs:
         with:
           submodules: recursive
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake gcc g++ libglpk-dev coinor-cbc coinor-libcbc-dev libzip-dev libprotobuf-dev protobuf-compiler python3
+        run: sudo apt-get update && sudo apt-get install -y cmake gcc g++ libglpk-dev coinor-cbc coinor-libcbc-dev libzip-dev libprotobuf-dev protobuf-compiler python3 python3-pip
+      - name: Install pytest
+        run: pip install --break-system-packages pytest
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build
@@ -24,6 +26,8 @@ jobs:
         run: PYTHONPATH=wrapper PATH="$PWD/scripts:$PWD/build:$PATH" loom-map --help
       - name: Wrapper version
         run: PYTHONPATH=wrapper PATH="$PWD/scripts:$PWD/build:$PATH" loom-map --version
+      - name: Wrapper unit tests
+        run: PYTHONPATH=wrapper python3 -m pytest tests/ -v
       - name: End-to-end tiny GTFS
         run: tests/run_e2e.sh
       - name: Verify SVG
