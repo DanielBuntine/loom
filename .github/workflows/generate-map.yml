@@ -97,17 +97,26 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Resolve image (pull published, build+push fallback)
+      - name: Resolve image (pin to commit, latest, then build+push fallback)
         id: image
         shell: bash
         run: |
           set -euo pipefail
           owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          # Prefer the image built from this exact commit: `latest` can be
+          # stale relative to the ref this workflow was dispatched on (e.g. a
+          # feature branch, or a manual run before build-image.yml has
+          # published this commit yet), and this workflow's `graph` job
+          # relies on wrapper CLI flags that only exist from this commit on.
+          pinned="ghcr.io/$owner/${IMAGE_NAME}:sha-${{ github.sha }}"
           published="ghcr.io/$owner/${IMAGE_NAME}:latest"
-          if docker pull "$published"; then
+          if docker pull "$pinned"; then
+            echo "image=$pinned" >> "$GITHUB_OUTPUT"
+          elif docker pull "$published"; then
+            echo "::warning::No image published for commit ${{ github.sha }}; falling back to :latest, which may not match this commit."
             echo "image=$published" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::Published image '$published' not found; building locally as a one-off fallback (run 'Build and Publish Docker Image' on main to avoid this)."
+            echo "::warning::No published image found; building locally as a one-off fallback (run 'Build and Publish Docker Image' on main to avoid this)."
             fallback="ghcr.io/$owner/${IMAGE_NAME}:run-${{ github.run_id }}"
             docker build -t "$fallback" .
             docker push "$fallback"
@@ -137,12 +146,21 @@ jobs:
     needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    permissions:
+      packages: read
     steps:
       - name: Download GTFS feed
         uses: actions/download-artifact@v7
         with:
           name: loom-map-gtfs-feed
           path: work
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull image
         run: docker pull '${{ needs.prepare.outputs.image }}'
@@ -179,12 +197,21 @@ jobs:
     needs: [prepare, graph]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      packages: read
     steps:
       - name: Download graph
         uses: actions/download-artifact@v7
         with:
           name: loom-map-graph
           path: work
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull image
         run: docker pull '${{ needs.prepare.outputs.image }}'
@@ -220,12 +247,21 @@ jobs:
     # Bounding it means a bad run now fails loudly here (with the topology
     # artifact preserved for diagnosis) instead of an opaque multi-hour hang.
     timeout-minutes: 90
+    permissions:
+      packages: read
     steps:
       - name: Download topology
         uses: actions/download-artifact@v7
         with:
           name: loom-map-topology
           path: work
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull image
         run: docker pull '${{ needs.prepare.outputs.image }}'
@@ -258,6 +294,8 @@ jobs:
     needs: [prepare, line-ordering]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    permissions:
+      packages: read
     strategy:
       fail-fast: false
       matrix:
@@ -268,6 +306,13 @@ jobs:
         with:
           name: loom-map-line-ordering
           path: work
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull image
         run: docker pull '${{ needs.prepare.outputs.image }}'

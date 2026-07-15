@@ -38,16 +38,28 @@ def filter_route_ids(routes: List[dict], wanted: Iterable[str]) -> Set[str]:
 
 
 def aggregate_route_map(routes: List[dict]) -> Dict[str, str]:
-    """Map every route_id to a canonical route_id, grouped by route_short_name.
+    """Map every route_id to a canonical route_id, grouped by
+    (route_short_name, route_type, agency_id).
 
-    Routes with no route_short_name are left unaggregated. The canonical
-    route_id within a group is its lexicographically smallest route_id, kept
-    deterministic across runs rather than picking e.g. the busiest variant.
+    route_type and agency_id are part of the key, not just route_short_name,
+    because gtfs2graph filters trips by the *rewritten* route's route_type
+    (via -m/--mots). Merging e.g. bus route "1" and rail route "1" onto one
+    canonical route_id would make gtfs2graph classify every merged trip as
+    whichever mode the canonical route happens to be, silently dropping or
+    misclassifying trips under --mode. Routes with no route_short_name are
+    left unaggregated. The canonical route_id within a group is its
+    lexicographically smallest route_id, kept deterministic across runs
+    rather than picking e.g. the busiest variant.
     """
     groups: Dict[str, List[str]] = {}
     for r in routes:
         name = r.get("route_short_name", "").strip()
-        key = f"name:{name}" if name else f"id:{r['route_id']}"
+        if not name:
+            key = f"id:{r['route_id']}"
+        else:
+            route_type = r.get("route_type", "").strip()
+            agency = r.get("agency_id", "").strip()
+            key = f"name:{name}|type:{route_type}|agency:{agency}"
         groups.setdefault(key, []).append(r["route_id"])
 
     mapping: Dict[str, str] = {}
@@ -100,7 +112,10 @@ def preprocess_gtfs(
         stop_times_member = member_by_name.get("stop_times.txt")
         stop_time_fields: List[str] = []
         stop_times_rows: Optional[List[dict]] = None
-        if stop_times_member:
+        # Only route filtering touches stop_times; aggregation only rewrites
+        # routes.txt/trips.txt, so skip parsing this (often huge) file when
+        # there's nothing to filter and just pass it through unchanged below.
+        if routes and stop_times_member:
             stop_time_fields, stop_times_rows = _read_csv_rows(archive, stop_times_member)
 
         if routes:

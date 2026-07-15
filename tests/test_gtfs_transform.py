@@ -59,6 +59,28 @@ def test_aggregate_route_map_leaves_unnamed_routes_unaggregated():
     assert mapping["R5"] == "R5"
 
 
+def test_aggregate_route_map_does_not_merge_across_route_type():
+    # Bus "1" and rail "1" share a public short name but must stay separate:
+    # gtfs2graph filters trips by the *rewritten* route's route_type, so
+    # merging them would make --mode rail silently drop or misclassify trips.
+    routes = [
+        {"route_id": "BUS1", "route_short_name": "1", "route_type": "3", "agency_id": "A"},
+        {"route_id": "RAIL1", "route_short_name": "1", "route_type": "2", "agency_id": "A"},
+    ]
+    mapping = aggregate_route_map(routes)
+    assert mapping["BUS1"] == "BUS1"
+    assert mapping["RAIL1"] == "RAIL1"
+
+
+def test_aggregate_route_map_merges_within_same_type_and_agency():
+    routes = [
+        {"route_id": "R1", "route_short_name": "T1", "route_type": "2", "agency_id": "A"},
+        {"route_id": "R2", "route_short_name": "T1", "route_type": "2", "agency_id": "A"},
+    ]
+    mapping = aggregate_route_map(routes)
+    assert mapping["R1"] == mapping["R2"] == "R1"
+
+
 def _write_gtfs_zip(path: Path, files: dict) -> Path:
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, content in files.items():
@@ -145,3 +167,46 @@ def test_preprocess_gtfs_filter_then_aggregate(tmp_path):
         assert {r["route_id"] for r in routes} == {"R1"}
         assert {t["route_id"] for t in trips} == {"R1"}
         assert {t["trip_id"] for t in trips} == {"T1", "T2"}
+
+
+def test_preprocess_gtfs_aggregation_only_passes_stop_times_through_unparsed(tmp_path):
+    # Aggregation never touches stop_times.txt, so it should be copied through
+    # byte-for-byte rather than parsed and re-serialized (and, for large
+    # feeds, should never be read into memory at all -- see preprocess_gtfs).
+    files = _dup_route_gtfs_files()
+    gtfs = _write_gtfs_zip(tmp_path / "in.zip", files)
+    result = preprocess_gtfs(gtfs, tmp_path / "work", aggregate_by="route_short_name", routes=None)
+    with zipfile.ZipFile(result) as archive:
+        assert archive.read("stop_times.txt") == files["stop_times.txt"].encode("utf-8")
+
+
+def test_aggregate_route_map_respects_route_type_end_to_end(tmp_path):
+    files = {
+        "agency.txt": "agency_id,agency_name,agency_url,agency_timezone\nA,Tiny Transit,https://example.com,Etc/UTC\n",
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\nS1,Alpha,47.0000,7.0000\nS2,Beta,47.0100,7.0100\n",
+        "routes.txt": (
+            "route_id,agency_id,route_short_name,route_long_name,route_type,route_color\n"
+            "BUS1,A,1,Bus One,3,3366cc\n"
+            "RAIL1,A,1,Rail One,2,cc3366\n"
+        ),
+        "trips.txt": (
+            "route_id,service_id,trip_id,trip_headsign\n"
+            "BUS1,WK,TB1,Beta\n"
+            "RAIL1,WK,TR1,Beta\n"
+        ),
+        "stop_times.txt": (
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "TB1,08:00:00,08:00:00,S1,1\nTB1,08:05:00,08:05:00,S2,2\n"
+            "TR1,09:00:00,09:00:00,S1,1\nTR1,09:05:00,09:05:00,S2,2\n"
+        ),
+    }
+    gtfs = _write_gtfs_zip(tmp_path / "in.zip", files)
+    result = preprocess_gtfs(gtfs, tmp_path / "work", aggregate_by="route_short_name", routes=None)
+    with zipfile.ZipFile(result) as archive:
+        routes = _read_csv(archive, "routes.txt")
+        trips = _read_csv(archive, "trips.txt")
+        # both routes survive as their own canonical id -- bus and rail "1" must not merge
+        assert {r["route_id"] for r in routes} == {"BUS1", "RAIL1"}
+        trip_route_ids = {t["trip_id"]: t["route_id"] for t in trips}
+        assert trip_route_ids["TB1"] == "BUS1"
+        assert trip_route_ids["TR1"] == "RAIL1"
