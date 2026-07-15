@@ -16,7 +16,7 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install --no-install-recommends -y \
-       ca-certificates python3 libglpk40 coinor-cbc libzip4 libprotobuf32t64 \
+       ca-certificates python3 libglpk40 coinor-cbc libzip4t64 libprotobuf32t64 libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /opt/loom /usr/local
 COPY wrapper/loom_map /opt/loom-wrapper/loom_map

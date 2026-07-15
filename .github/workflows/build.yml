@@ -27,10 +27,12 @@ jobs:
       - name: End-to-end tiny GTFS
         run: tests/run_e2e.sh
       - name: Verify SVG
-        run: test -s tests/tiny-gtfs.svg && python3 - <<'PY'
-from pathlib import Path
-assert b'<svg' in Path('tests/tiny-gtfs.svg').read_bytes()[:4096].lower()
-PY
+        run: |
+          test -s tests/tiny-gtfs.svg
+          python3 - <<'PY'
+          from pathlib import Path
+          assert b'<svg' in Path('tests/tiny-gtfs.svg').read_bytes()[:4096].lower()
+          PY
 
   docker-build:
     runs-on: ubuntu-24.04
