@@ -1,41 +1,28 @@
-FROM ubuntu:20.04
-ARG GRB_VERSION=9.1.2
-ARG GRB_SHORT_VERSION=9.1
-
+FROM ubuntu:24.04 AS build
 ENV DEBIAN_FRONTEND=noninteractive
-
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y\
-       ca-certificates  \
-	   libglpk-dev \
-	   glpk-utils \
-	   coinor-libcbc-dev \
-	   coinor-cbc \
-	   libprotobuf-dev \
-	   libzip-dev \
-	   protobuf-compiler \
-       make \
-       cmake \
-       wget \
-	   g++ \
-       git \
-    && update-ca-certificates \
-    && wget -q https://packages.gurobi.com/${GRB_SHORT_VERSION}/gurobi${GRB_VERSION}_linux64.tar.gz \
-    && tar -xf gurobi${GRB_VERSION}_linux64.tar.gz  \
-    && rm -f gurobi${GRB_VERSION}_linux64.tar.gz \
-    && mv -f gurobi* gurobi \
-    && rm -rf gurobi/linux64/docs
+    && apt-get install --no-install-recommends -y \
+       ca-certificates cmake g++ make git libglpk-dev coinor-libcbc-dev libzip-dev \
+       libprotobuf-dev protobuf-compiler python3 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src/loom
+COPY . .
+RUN git submodule update --init --recursive
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build --parallel "$(nproc)" \
+    && cmake --install build --prefix /opt/loom
 
-ENV GUROBI_HOME /opt/gurobi/linux64
-ENV PATH $PATH:$GUROBI_HOME/bin:/loom/build
-ENV LD_LIBRARY_PATH $GUROBI_HOME/lib
-
-RUN git clone --recurse-submodules https://github.com/ad-freiburg/loom /loom
-
-ENV GRB_LICENSE_FILE /gurobi/gurobi.lic
-
-RUN cd /loom && rm -rf build && mkdir build && cd build && cmake .. && make -j20 install
-
-WORKDIR /
-
-CMD loom
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y \
+       ca-certificates python3 libglpk40 coinor-cbc libzip4t64 libprotobuf32t64 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /opt/loom /usr/local
+COPY wrapper/loom_map /opt/loom-wrapper/loom_map
+COPY scripts/loom-map /usr/local/bin/loom-map
+COPY scripts/loom-entrypoint /usr/local/bin/loom-entrypoint
+ENV PYTHONPATH=/opt/loom-wrapper
+WORKDIR /data
+ENTRYPOINT ["loom-entrypoint"]
+CMD ["--help"]
