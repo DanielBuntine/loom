@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "loom-map-wrapper"
+version = "0.1.0"
+description = "User-friendly wrapper around LOOM transit map generation tools"
+requires-python = ">=3.9"
+license = {text = "GPL-3.0-or-later"}
+
+[project.scripts]
+loom-map = "loom_map.cli:main"
+
+[tool.setuptools]
+packages = ["loom_map"]

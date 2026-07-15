@@ -1,0 +1,116 @@
+name: Generate Transit Diagram
+
+on:
+  workflow_dispatch:
+    inputs:
+      gtfs_url:
+        description: Public http(s) URL to a GTFS ZIP feed
+        required: true
+        type: string
+      mode:
+        description: Transit mode
+        required: true
+        default: rail
+        type: choice
+        options: [all, tram, subway, rail, bus, ferry, cablecar, gondola, funicular, coach, monorail, trolley]
+      layout:
+        description: Map layout
+        required: true
+        default: octilinear
+        type: choice
+        options: [geographic, octilinear, orthoradial]
+      labels:
+        description: Render station labels
+        required: true
+        default: false
+        type: boolean
+      save_intermediates:
+        description: Upload intermediate GeoJSON files
+        required: true
+        default: false
+        type: boolean
+      output_name:
+        description: Output SVG filename, without paths
+        required: true
+        default: network.svg
+        type: string
+
+jobs:
+  generate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Prepare names
+        id: names
+        shell: bash
+        run: |
+          set -euo pipefail
+          out='${{ inputs.output_name }}'
+          base="$(basename "$out")"
+          if [[ "$base" != *.svg ]]; then base="$base.svg"; fi
+          if [[ "$base" == ".svg" || "$base" == *"/"* || "$base" == *".."* ]]; then
+            echo "Invalid output_name" >&2
+            exit 1
+          fi
+          echo "svg=$base" >> "$GITHUB_OUTPUT"
+      - name: Build Docker image
+        run: docker build -t loom-map .
+      - name: Download GTFS feed
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='${{ inputs.gtfs_url }}'
+          case "$url" in http://*|https://*) ;; *) echo "gtfs_url must start with http:// or https://" >&2; exit 1;; esac
+          mkdir -p work artifacts diagnostics
+          curl --fail --location --show-error --silent --connect-timeout 20 --max-time 300 --output work/input.gtfs.zip "$url"
+          test -s work/input.gtfs.zip
+      - name: Generate map
+        id: generate
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(/data/work/input.gtfs.zip --mode '${{ inputs.mode }}' --layout '${{ inputs.layout }}' --output "/data/artifacts/${{ steps.names.outputs.svg }}" --work-dir /data/work/debug --verbose)
+          if [[ '${{ inputs.labels }}' == 'true' ]]; then args+=(--labels); else args+=(--no-labels); fi
+          if [[ '${{ inputs.save_intermediates }}' == 'true' ]]; then args+=(--save-intermediates); fi
+          docker run --rm -v "$PWD:/data" loom-map "${args[@]}" 2>&1 | tee diagnostics/loom-map.log
+      - name: Upload SVG artifact
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: loom-map-svg
+          path: artifacts/${{ steps.names.outputs.svg }}
+          if-no-files-found: error
+      - name: Upload intermediates
+        if: success() && inputs.save_intermediates
+        uses: actions/upload-artifact@v7
+        with:
+          name: loom-map-intermediates
+          path: work/debug/*
+          if-no-files-found: warn
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: loom-map-diagnostics
+          path: |
+            diagnostics/*
+            work/debug/*
+          if-no-files-found: warn
+      - name: Write summary
+        if: always()
+        shell: bash
+        run: |
+          result="${{ job.status }}"
+          {
+            echo "## LOOM map generation"
+            echo ""
+            echo "Input GTFS: ${{ inputs.gtfs_url }}"
+            echo "Mode: ${{ inputs.mode }}"
+            echo "Layout: ${{ inputs.layout }}"
+            echo "Labels: ${{ inputs.labels }}"
+            echo "Output: ${{ steps.names.outputs.svg }}"
+            echo "Result: $result"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+case "${1:-}" in
+  gtfs2graph|topo|loom|octi|transitmap|topoeval)
+    exec "$@"
+    ;;
+  "")
+    exec loom-map --help
+    ;;
+  *)
+    exec loom-map "$@"
+    ;;
+esac
